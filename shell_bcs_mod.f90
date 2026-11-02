@@ -55,6 +55,8 @@ module shell_bcs_mod
     use potential_gh_mod, only: ellipsoid_shape, epsilon_shape, epsilon_shape_from, surface_quadrature, &
                                 gauss_legendre
     use micro_constant_mod, only: microscopic_variables, a_pot, N_bas, mi_p, C_s, r_mic, mi_r_mac
+    use shape_mod, only: surface_shape
+    use qs3_shape_mod, only: qs3_shape
     implicit none
     private
 
@@ -100,14 +102,23 @@ module shell_bcs_mod
 
     contains
 
-        subroutine shell_bcs_calculation(nucleus, mv, res, n_gh, pairing)
+        subroutine shell_bcs_calculation(nucleus, mv, res, n_gh, pairing, qs3, n_basis)
             !---------------------------
             ! shell + pairing correction of the nucleus at the deformation
             ! (nucleus%epsilon2, nucleus%gamma_deg, nucleus%epsilon3, nucleus%epsilon4, nucleus%epsilon6).
             ! mv receives the potential quantities (micro_constant_mod).
             ! n_gh   : Gauss-Hermite points per axis (default 44)
             ! pairing: 'LN' (Lipkin-Nogami, default, as FRDM2012) or 'BCS'
+            ! qs3    : if present, the 3QS shape is used instead of the epsilon shape (it is
+            !          rescaled to the radius R_pot); the HO basis is that of the spheroid with
+            !          the same volume and quadrupole moment q = int (2z^2 - rho^2) dV/(V R^2)
+            !          = 2/5 (c^2 - a^2)/R^2, a^2 c = R^3.
+            ! n_basis: number of oscillator shells (default N_bas = 12 of micro_constant_mod)
             !---------------------------
+            ! 【3QS】qs3 を渡すと, その形 (半径 R_pot に拡大縮小) のポテンシャルを使う.
+            ! 振動子基底は同じ体積と四重極モーメントの回転楕円体 (半軸 a, c) の振動数
+            ! hbar omega_z = hbar omega0 R/c, hbar omega_perp = hbar omega0 R/a にする.
+            ! 細長い形では n_basis (殻の数) を増やす必要がある.
             ! 【日本語】
             ! 【目的】変形 (eps2, gamma, eps3, eps4, eps6) での殻補正と対補正を
             ! 中性子・陽子それぞれ計算する.
@@ -122,12 +133,14 @@ module shell_bcs_mod
             type(shell_bcs_result), intent(out) :: res
             integer, intent(in), optional :: n_gh
             character(*), intent(in), optional :: pairing
+            type(qs3_shape), intent(in), optional :: qs3
+            integer, intent(in), optional :: n_basis
 
-            real(dp) :: eps, gam
-            integer :: ngh, ns
-            logical :: use_ln
+            real(dp) :: eps, gam, hw(3), cr
+            integer :: ngh, ns, nb
+            logical :: use_ln, d2h
             type(ho_basis_type) :: basis
-            type(epsilon_shape) :: shape
+            class(surface_shape), allocatable :: shape
             type(surface_quadrature) :: q
             real(dp), allocatable :: xg(:), yg(:), zg(:)
             real(dp), allocatable :: Y(:,:,:), dYx(:,:,:), dYy(:,:,:), dYz(:,:,:), C(:,:,:)
@@ -148,16 +161,28 @@ module shell_bcs_mod
             !---------------------------
             ! basis, shape and potentials on the Gauss-Hermite points
             !---------------------------
-            call basis%initialize(frequencies_from_eps_gamma(mv%hbar_omega0, eps, gam), nint(N_bas), ngh)
+            nb = nint(N_bas)
+            if (present(n_basis)) nb = n_basis
+            if (present(qs3)) then
+                cr = spheroid_c_over_R(qs3%q2_hat())
+                hw = mv%hbar_omega0 * [sqrt(cr), sqrt(cr), 1.0_dp / cr]   ! R/a = (c/R)^(1/2), R/c
+                allocate(shape, source=qs3%scaled(mv%R_pot))
+                d2h = qs3%reflection_symmetric()
+            else
+                hw = frequencies_from_eps_gamma(mv%hbar_omega0, eps, gam)
+                allocate(shape, source=epsilon_shape_from(mv%R_pot, eps, gam, nucleus%epsilon3, &
+                                                          nucleus%epsilon4, nucleus%epsilon6))
+                d2h = nucleus%epsilon3 == 0.0_dp
+            end if
+            call basis%initialize(hw, nb, ngh)
             ns = basis%n_states
-            shape = epsilon_shape_from(mv%R_pot, eps, gam, nucleus%epsilon3, nucleus%epsilon4, nucleus%epsilon6)
             call q%initialize(shape, a_pot, 8, 16, 8)
             xg = basis%b(1) * basis%xi
             yg = basis%b(2) * basis%xi
             zg = basis%b(3) * basis%xi
             allocate(Y(ngh, ngh, ngh), dYx(ngh, ngh, ngh), dYy(ngh, ngh, ngh), dYz(ngh, ngh, ngh), C(ngh, ngh, ngh))
-            ! the octant filling needs the z reflection, which eps3 /= 0 breaks
-            call q%on_grid(xg, yg, zg, Y, dYx, dYy, dYz, C, nucleus%epsilon3 == 0.0_dp)
+            ! the octant filling needs the z reflection, which eps3 /= 0 (or a 3QS mass asymmetry) breaks
+            call q%on_grid(xg, yg, zg, Y, dYx, dYy, dYz, C, d2h)
 
             !---------------------------
             ! single-particle spectra
@@ -213,6 +238,25 @@ module shell_bcs_mod
             end subroutine correct_one
 
         end subroutine shell_bcs_calculation
+
+        pure function spheroid_c_over_R(q) result(cr)
+            !---------------------------
+            ! c/R of the spheroid (semi-axes a, a, c; a^2 c = R^3) with
+            ! q = int (2 z^2 - rho^2) dV/(V R^2) = 2/5 (c^2 - a^2)/R^2:
+            ! with x = c/R, 2/5 (x^2 - 1/x) = q, solved by Newton's method (unique root x > 0).
+            !---------------------------
+            ! 【目的】体積と四重極モーメント q が同じ回転楕円体の c/R (3QS の振動子基底用).
+            real(dp), intent(in) :: q
+            real(dp) :: cr, f, df
+            integer :: it
+            cr = max(1.0_dp, 1.0_dp + q)
+            do it = 1, 100
+                f = 0.4_dp * (cr * cr - 1.0_dp / cr) - q
+                df = 0.4_dp * (2.0_dp * cr + 1.0_dp / (cr * cr))
+                cr = cr - f / df
+                if (abs(f) < 1.0e-14_dp) exit
+            end do
+        end function spheroid_c_over_R
 
         !==========================================================================
         ! Strutinsky shell correction

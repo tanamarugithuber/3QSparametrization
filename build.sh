@@ -30,6 +30,7 @@ FC="gfortran -O2 -fopenmp"
 $FC -c constant_mod.f90
 $FC -c nucleus_mod.f90
 $FC -c shape_mod.f90
+$FC -c qs3_shape_mod.f90
 $FC -c grid_mod.f90
 $FC -I"$FFTW_INC" -c calculate_potential_hockney.f90
 $FC -c frldm_mod.f90
@@ -44,6 +45,7 @@ $FC \
     constant_mod.o \
     nucleus_mod.o \
     shape_mod.o \
+    qs3_shape_mod.o \
     grid_mod.o \
     calculate_potential_hockney.o \
     frldm_mod.o \

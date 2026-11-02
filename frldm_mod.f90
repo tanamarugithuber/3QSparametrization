@@ -5,6 +5,7 @@ module frldm_mod
     use nucleus_mod, only: nucleus_property
     use grid_mod, only: grid_type
     use shape_mod, only: surface_shape, gauss_legendre
+    use qs3_shape_mod, only: qs3_shape
     use hockney_mod, only: hockney_coulomb, hockney_yukawa, hockney_exp
     implicit none
     private
@@ -99,6 +100,7 @@ module frldm_mod
     end type frldm_variables
 
     public :: frldm_variables
+    public :: axial_sums
 
     contains
         subroutine calculate_exp(this, g_mod)
@@ -346,7 +348,13 @@ module frldm_mod
                           * (145.0_dp / 48.0_dp - 327.0_dp / 2880.0_dp * (this%k_f * r_p)**2 &
                              + 1527.0_dp / 1209600.0_dp * (this%k_f * r_p)**4)
             this%B_s = shape%relative_area()                                    ! Eq. (70)
+            ! B_W = 1 for single-body shapes; for 3QS shapes with a neck, FRDM2012 Eq. (75)
+            ! 【B_W】一体の形では 1. 首のある 3QS 形状では FRDM2012 式 (75) (qs3_shape_mod の b_w).
             this%B_w = 1.0_dp
+            select type (shape)
+            type is (qs3_shape)
+                this%B_w = shape%b_w(a_d)
+            end select
             this%delta_n_ave = r_mac * this%B_s / N**(1.0_dp / 3.0_dp)               ! Eq. (63)
             this%delta_p_ave = r_mac * this%B_s / Z**(1.0_dp / 3.0_dp)               ! Eq. (64)
             this%delta_pn_ave = h_np / (this%B_s * A**(2.0_dp / 3.0_dp))             ! Eq. (65)
@@ -442,8 +450,21 @@ module frldm_mod
             if (present(n_quad)) n1 = n_quad
             n1 = 4 * ((n1 + 3) / 4)
             n2 = 4 * ((3 * n1 / 2 + 3) / 4)
-            call surface_sums(shape, n1, s1a, s3a)
-            call surface_sums(shape, n2, s1b, s3b)
+            select type (shape)
+            type is (qs3_shape)
+                ! axially symmetric 3QS shape: rings (axial_sums). The ring spacing along the
+                ! meridian is that of n Gauss points on the half circle of the sphere, i.e.
+                ! n L/(pi R) rings for the meridian length L. B_3 (smooth integrand) needs only
+                ! half as many.
+                ! 【3QS】軸対称なのでリングの和 (axial_sums) で計算する. 子午線に沿った点の間隔は
+                ! 球で n 点のときと同じにする. B_3 は被積分関数がなめらかなので半分の点数でよい.
+                call qs3_sums(shape, n1, .true., .false., s1a, s3a)
+                call qs3_sums(shape, n2, .true., .false., s1b, s3b)
+                call qs3_sums(shape, n1 / 2, .false., .true., s3a, s3b)
+            class default
+                call surface_sums(shape, n1, s1a, s3a)
+                call surface_sums(shape, n2, s1b, s3b)
+            end select
             s1a = (real(n2, dp)**3 * s1b - real(n1, dp)**3 * s1a) / (real(n2, dp)**3 - real(n1, dp)**3)
 
             A = real(nucleus%A, dp)
@@ -500,5 +521,96 @@ module frldm_mod
             S1 = 4.0_dp * S1
             S3 = 4.0_dp * S3
         end subroutine surface_sums
+
+        subroutine qs3_sums(shape, n, want1, want3, S1, S3)
+            ! S1, S3 of surface_sums for a 3QS shape (see calculate_b_1_b_3_surface for n)
+            type(qs3_shape), intent(in) :: shape
+            integer, intent(in) :: n
+            logical, intent(in) :: want1, want3
+            real(dp), intent(out) :: S1, S3
+            real(dp), allocatable :: z(:), rho(:), pz(:), w(:)
+            real(dp) :: n_tot, spacing
+            integer :: nphi
+            n_tot = n * shape%profile_length() / (pi * shape%R)
+            call shape%axial_nodes(nint(n_tot), z, rho, pz, w)
+            ! azimuths: the same spacing as along the meridian at the widest ring
+            spacing = shape%profile_length() / n_tot
+            nphi = max(16, 2 * nint(pi * maxval(rho) / spacing))
+            call axial_sums(z, rho, pz, w, nphi, S1, S3, want1, want3)
+        end subroutine qs3_sums
+
+        subroutine axial_sums(z, rho, pz, w, nphi, S1, S3, want1, want3)
+            !----------------------------
+            ! S1 = oint oint dS.dS' e^(-sigma/a_Yukawa), S3 = oint oint dS.dS' G(sigma/a_den)
+            ! (the kernels of surface_sums) for an axially symmetric surface given by rings k at
+            ! (rho_k, z_k) with weights w_k and vector area element
+            ! (rho_k cos phi, rho_k sin phi, pz_k) w_k dphi.
+            ! The azimuths phi_j = 2 pi (j - 1/2)/nphi are the same for all rings, so the double
+            ! sum over (ring, azimuth) pairs equals nphi times the sum with the first point at
+            ! phi = pi/nphi: Delta phi = 2 pi m/nphi, m = 0, ..., nphi - 1 (as surface_sums with
+            ! its trapezoid rule in phi, but without the sum over the first azimuth).
+            !   S = 2 pi sum_k w_k sum_l w_l (2 pi/nphi) sum_m [rho_k rho_l cos(Dphi_m) + pz_k pz_l] g(sigma_klm)
+            ! Ring pairs farther apart than 40 a_Yukawa are skipped in S1 (e^-40 ~ 4e-18).
+            ! want1, want3 (default .true.) select the sums.
+            !----------------------------
+            ! 【目的】軸対称な表面 (リング k: 半径 rho_k, 位置 z_k, 重み w_k) について,
+            ! surface_sums と同じ S1, S3 を計算する. 外側の点の方位角は 1 つでよいので速い.
+            real(dp), intent(in) :: z(:), rho(:), pz(:), w(:)
+            integer, intent(in) :: nphi
+            real(dp), intent(out) :: S1, S3
+            logical, intent(in), optional :: want1, want3
+            real(dp) :: cphi(0:nphi - 1), wm(0:nphi - 1), sig, d, s, t1, t3, fac, far2
+            integer :: k, l, m, nr
+            logical :: do1, do3, near
+
+            do1 = .true.
+            do3 = .true.
+            if (present(want1)) do1 = want1
+            if (present(want3)) do3 = want3
+            nr = size(z)
+            far2 = (40.0_dp * a_Yukawa)**2
+            do m = 0, nphi - 1
+                cphi(m) = cos(2.0_dp * pi * m / nphi)
+            end do
+            ! Delta phi and 2 pi - Delta phi give the same term: fold m > nphi/2 onto m < nphi/2
+            wm = 0.0_dp
+            do m = 0, nphi - 1
+                wm(min(m, nphi - m)) = wm(min(m, nphi - m)) + 1.0_dp
+            end do
+            S1 = 0.0_dp
+            S3 = 0.0_dp
+            !$omp parallel do default(none) shared(z, rho, pz, w, cphi, wm, nr, nphi, do1, do3, far2) &
+            !$omp private(l, m, sig, d, s, t1, t3, fac, near) reduction(+:S1, S3) schedule(dynamic)
+            do k = 1, nr
+                do l = k, nr
+                    t1 = 0.0_dp
+                    t3 = 0.0_dp
+                    near = do1 .and. ((z(k) - z(l))**2 + (rho(k) - rho(l))**2 < far2)
+                    if (near .or. do3) then
+                        do m = 0, nphi / 2
+                            sig = sqrt(max(0.0_dp, rho(k)**2 + rho(l)**2 - 2.0_dp * rho(k) * rho(l) * cphi(m) &
+                                       + (z(k) - z(l))**2))
+                            d = wm(m) * (rho(k) * rho(l) * cphi(m) + pz(k) * pz(l))
+                            if (near) t1 = t1 + d * exp(-sig / a_Yukawa)
+                            if (do3) then
+                                s = sig / a_den
+                                if (s > 1.0e-4_dp) then
+                                    t3 = t3 + d * (0.5_dp * s - 0.5_dp * exp(-s) + 2.0_dp * (1.0_dp - exp(-s)) / s)
+                                else
+                                    t3 = t3 + d * (1.5_dp + s**2 / 12.0_dp)
+                                end if
+                            end if
+                        end do
+                    end if
+                    fac = w(k) * w(l)
+                    if (l /= k) fac = 2.0_dp * fac
+                    S1 = S1 + fac * t1
+                    S3 = S3 + fac * t3
+                end do
+            end do
+            !$omp end parallel do
+            S1 = S1 * 2.0_dp * pi * (2.0_dp * pi / nphi)
+            S3 = S3 * 2.0_dp * pi * (2.0_dp * pi / nphi)
+        end subroutine axial_sums
 
 end module frldm_mod

@@ -1,0 +1,5 @@
+*.o
+*.mod
+*.exe
+build_3qs/
+runs_frdm2012/
