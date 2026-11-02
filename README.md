@@ -4,6 +4,15 @@
 
 このプロジェクトは、原子核物理学におけるFRLDM+Shell+BCSを解くためのプログラム群です．
 
+## 3QS 形状による核分裂の鞍点
+
+P. Möller et al., Phys. Rev. C 79, 064304 (2009) の三つの 2 次曲面（3QS）の形で FRLDM（と殻補正・対補正）のポテンシャル曲面を 5 次元の格子 (Q2, d, εf1, εf2, αg) で計算し，immersion 法で核分裂の鞍点を求めるプログラム（pes3qs.exe，saddle3qs.exe）があります．使い方と中身は [README_3QS.md](README_3QS.md) を見てください．
+
+```bash
+bash build_3qs.sh
+./pes3qs.exe pes3qs.nml && ./saddle3qs.exe saddle3qs.nml
+```
+
 ## オブジェクト指向プログラミングに慣れていない人向け
 
 このコードは Fortran のオブジェクト指向の書き方（派生型，型束縛手続き `call frldm%calculate_frldm_energy(...)` など）を使っています．慣れていない人は，先に解説書を読んでください．
@@ -124,6 +133,24 @@ graph TD;
     zero_point_mod.f90-->main.f90;
 ```
 
+### 3QS の鞍点で使うファイル
+
+```mermaid
+graph TD;
+    shape_mod.f90-->qs3_shape_mod.f90;
+    qs3_shape_mod.f90-->qs3_coord_mod.f90;
+    qs3_shape_mod.f90-->frldm_mod.f90;
+    qs3_shape_mod.f90-->shell_bcs_mod.f90;
+    qs3_coord_mod.f90-->pes3qs.f90;
+    frldm_mod.f90-->pes3qs.f90;
+    shell_bcs_mod.f90-->pes3qs.f90;
+    immersion_mod.f90-->saddle3qs.f90;
+```
+
+- qs3_shape_mod：3QS 形状（surface_shape を拡張）．qs3_coord_mod：PRC 79 の座標 (Q2, d, εf1, εf2, αg) から 3QS の σ, α．
+- frldm_mod は 3QS の形で B_1, B_3 を軸対称のリング和で計算し，B_W に FRDM2012 式 (75) を使います．shell_bcs_mod は `qs3=` を渡すと 3QS の形のポテンシャルを使います．
+- immersion_mod：immersion 法（ダム法つき）．
+
 - 形状：shape_mod（FRDM の ε パラメータの形）を FRLDM と一粒子ポテンシャルの両方で使います．
 - FRLDM：frldm_mod が B_1, B_3 を形の表面積分で計算します（`use_grid` のときは grid_mod + calculate_potential_hockney）．
 - Shell+pairing：ho_basis_mod（三軸変形 HO 基底）と potential_gh_mod（求積点上の V1, VC）で一粒子準位を求め，shell_bcs_mod でシェル補正と対補正を計算します．
@@ -143,6 +170,9 @@ graph TD;
     calculate_potential_hockney.f90-->test_hockney.f90;
     shell_bcs_mod.f90-->test_shell_bcs.f90;
     zero_point_mod.f90-->test_zero_point.f90;
+    qs3_coord_mod.f90-->test_qs3.f90;
+    frldm_mod.f90-->test_frldm_3qs.f90;
+    immersion_mod.f90-->test_immersion.f90;
 ```
 
 ### 使わないファイル (not_use/)
@@ -178,7 +208,7 @@ gfortran -O2 constant_mod.f90 shape_mod.f90 test_shape.f90 -o test_shape.exe
 - B_W = 1（基底状態の一体形状）としています．
 
 ```bash
-gfortran -O2 -fopenmp -I/usr/include constant_mod.f90 nucleus_mod.f90 shape_mod.f90 grid_mod.f90 calculate_potential_hockney.f90 frldm_mod.f90 test_frldm.f90 -lfftw3 -o test_frldm.exe
+gfortran -O2 -fopenmp -I/usr/include constant_mod.f90 nucleus_mod.f90 shape_mod.f90 qs3_shape_mod.f90 grid_mod.f90 calculate_potential_hockney.f90 frldm_mod.f90 test_frldm.f90 -lfftw3 -o test_frldm.exe
 ./test_frldm.exe
 ```
 
@@ -264,7 +294,7 @@ gfortran -O2 -fopenmp -I/usr/include constant_mod.f90 calculate_potential_hockne
    - r_mic = 3.2 MeV は Lipkin–Nogami 用の値です．BCS で使う場合は合わせ直す必要があります．
 
 ```bash
-gfortran -O2 -fopenmp constant_mod.f90 nucleus_mod.f90 shape_mod.f90 micro_constant_mod.f90 ho_basis_mod.f90 potential_gh_mod.f90 shell_bcs_mod.f90 test_shell_bcs.f90 -llapack -o test_shell_bcs.exe
+gfortran -O2 -fopenmp constant_mod.f90 nucleus_mod.f90 shape_mod.f90 qs3_shape_mod.f90 micro_constant_mod.f90 ho_basis_mod.f90 potential_gh_mod.f90 shell_bcs_mod.f90 test_shell_bcs.f90 -llapack -o test_shell_bcs.exe
 ./test_shell_bcs.exe
 ```
 
